@@ -1,0 +1,438 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  FeatureDimension:
+    Description: Instance type to launch trained production model endpoint with. 
+    Type: String
+    Default: 13
+  TrainingInstanceType:
+    Description: Instance type to launch trained production model endpoint with. 
+    Type: String
+    Default: ml.c4.xlarge
+  ProductionInstanceType:
+    Description: Instance type to launch trained production model endpoint with. 
+    Type: String
+    Default: ml.c4.xlarge
+  SageMakerExecutionRole:
+    Description: ARN of IAM role SageMaker can assume to access model artifacts and docker image for training and deployment on ML compute instances.
+    Type: String
+    NoEcho: true
+  EnableSlack:
+    Type: String
+    AllowedValues: [true, false]
+    Default: true
+  SlackAccessToken:
+    Description: OAuth access token from Slack app settings. If EnableSlack is False then this parameter can be empty
+    Type: String
+    NoEcho: true
+  SlackChannel:
+    Description: Slack channel to post notifications to. If EnableSlack is False then this parameter can be empty
+    Type: String
+  ModelPrefix: 
+    Description: Prefix to prepend to resources created for the model.
+    Type: String
+    Default: LinearLearner-HomePrices
+  TrainingInterval:
+    Description: Number of days to look into the past for training data
+    Type: String
+    Default: 7
+  BucketName:
+    Description: Name to create S3 bucket that will hold training data and model artifacts with. Must contain 'sagemaker' in name.
+    Type: String
+    Default: sagemaker-serverless-orchestration
+
+Resources:
+  RunDailyRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Name: ServerlessSageMakerOrchestrationRule
+      ScheduleExpression: rate(1 day)
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: !Ref SageMakerStateMachine
+          Id: "TargetFunctionV1"
+          RoleArn: !GetAtt ExecuteStateMachineRole.Arn
+
+  ExecuteStateMachineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: "AllowCWEServiceToAssumeRole"
+            Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "events.amazonaws.com"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "ExecuteStateMachine"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "states:StartExecution"
+                Resource: "*"
+
+  SageMakerStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub |-
+        {
+          "StartAt": "CheckData",
+          "States": {
+            "CheckData": {
+              "Type": "Task",
+              "Resource": "${CheckDataFunction.Arn}",
+              "ResultPath": "$",
+              "Next": "CheckDataBranch"
+            },
+            "CheckDataBranch": {
+              "Type": "Choice",
+              "Choices": [{
+                  "Variable": "$.no_new_data",
+                  "BooleanEquals": true,
+                  "Next": "NoNewData"
+                },
+                {
+                  "Variable": "$.no_new_data",
+                  "BooleanEquals": false,
+                  "Next": "StartTrainingJob"
+                }
+              ]
+            },
+            "StartTrainingJob": {
+              "Type": "Task",
+              "Resource": "${StartTrainingJobFunction.Arn}",
+              "ResultPath": "$",
+              "Next": "NotifySlack"
+            },
+            "NoNewData": {
+              "Type": "Pass",
+              "End": true
+            },
+            "CheckStatusBranch": {
+              "Type": "Choice",
+              "Choices": [{
+                  "Or": [{
+                      "Variable": "$.status",
+                      "StringEquals": "Completed"
+                    },
+                    {
+                      "Variable": "$.status",
+                      "StringEquals": "InService"
+                    }
+                  ],
+                  "Next": "NotifySlack"
+                },
+                {
+                  "Or": [{
+                      "Variable": "$.status",
+                      "StringEquals": "InProgress"
+                    },
+                    {
+                      "Variable": "$.status",
+                      "StringEquals": "Creating"
+                    },
+                    {
+                      "Variable": "$.status",
+                      "StringEquals": "Updating"
+                    }
+                  ],
+                  "Next": "CheckStatusWait"
+                },
+                {
+                  "Or": [{
+                      "Variable": "$.status",
+                      "StringEquals": "Failed"
+                    },
+                    {
+                      "Variable": "$.status",
+                      "StringEquals": "RollingBack"
+                    }
+                  ],
+                  "Next": "NotifySlack"
+                }
+              ]
+            },
+            "CheckStatusWait": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "GetStatus"
+            },
+            "GetStatus": {
+              "Type": "Task",
+              "Resource": "${GetStatusFunction.Arn}",
+              "ResultPath": "$",
+              "Next": "CheckStatusBranch"
+            },
+            "NotifySlackBranch": {
+              "Type": "Choice",
+              "Choices": [{
+                  "Or": [{
+                      "Variable": "$.status",
+                      "StringEquals": "InProgress"
+                    },
+                    {
+                      "Variable": "$.status",
+                      "StringEquals": "Creating"
+                    },
+                    {
+                      "Variable": "$.status",
+                      "StringEquals": "Updating"
+                    }
+                  ],
+                  "Next": "CheckStatusWait"
+                },
+                {
+                  "And": [{
+                      "Variable": "$.status",
+                      "StringEquals": "Failed"
+                    },
+                    {
+                      "Variable": "$.stage",
+                      "StringEquals": "Training"
+                    }
+                  ],
+                  "Next": "JobFailed"
+                },
+                {
+                  "Variable": "$.status",
+                  "StringEquals": "Completed",
+                  "Next": "JobCompleted"
+                },
+                {
+                  "Variable": "$.status",
+                  "StringEquals": "InService",
+                  "Next": "DeploymentCompleted"
+                },
+                {
+                  "And": [{
+                      "Or": [{
+                          "Variable": "$.status",
+                          "StringEquals": "Failed"
+                        },
+                        {
+                          "Variable": "$.status",
+                          "StringEquals": "RollingBack"
+                        }
+                      ]
+                    },
+                    {
+                      "Variable": "$.stage",
+                      "StringEquals": "Deployment"
+                    }
+                  ],
+                  "Next": "DeploymentFailed"
+                }
+              ]
+            },
+            "NotifySlack": {
+              "Type": "Task",
+              "Resource": "${NotifySlackFunction.Arn}",
+              "Next": "NotifySlackBranch"
+            },
+            "JobCompleted": {
+              "Type": "Pass",
+              "Next": "DeployModel"
+            },
+            "JobFailed": {
+              "Type": "Fail"
+            },
+            "DeployModel": {
+              "Type": "Task",
+              "Resource": "${DeployModelFunction.Arn}",
+              "Next": "NotifySlack"
+            },
+            "DeploymentCompleted": {
+              "Type": "Pass",
+              "Next": "UpdateParameters"
+            },
+            "DeploymentFailed": {
+              "Type": "Fail"
+            },
+            "UpdateParameters": {
+              "Type": "Task",
+              "Resource": "${UpdateParametersFunction.Arn}",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+
+  StepFunctionExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: !Sub states.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties: 
+      BucketName: !Ref BucketName
+
+  SSMParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties: 
+      Name: !Sub '/models/${ModelPrefix}/train/latest'
+      Description: Stores the date of latest training data model was run on.
+      Type: String
+      Value: 0
+
+  GetStatusFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: get_status.lambda_handler
+      Runtime: python3.6
+      CodeUri: ../lambda_functions/
+      Description: 'Checks status of SageMaker training jobs and endpoint deployment'
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "sagemaker:DescribeEndpoint"
+                - "sagemaker:DescribeTrainingJob"
+              Resource: "*"
+
+  UpdateParametersFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: update_parameters.lambda_handler
+      Runtime: python3.6
+      CodeUri: ../lambda_functions/
+      Description: 'Updates SSM Parameter Store parameter to reflect date of latest data file trained on.'
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "ssm:PutParameter"
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SSMParameter}'
+
+  DeployModelFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: deploy_model.lambda_handler
+      Runtime: python3.6
+      CodeUri: ../lambda_functions/
+      Description: 'Deploys trained model to invokable endpoint'
+      Timeout: 10
+      Environment:
+        Variables:
+          EXECUTION_ROLE: !Ref SageMakerExecutionRole
+          INSTANCE_TYPE: !Ref ProductionInstanceType
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "sagemaker:UpdateEndpoint"
+                - "sagemaker:CreateModel"
+                - "sagemaker:CreateEndpointConfig"
+                - "sagemaker:DescribeEndpoint"
+                - "sagemaker:CreateEndpoint"
+              Resource: "*"
+            - Effect: "Allow"
+              Action:
+                - "iam:PassRole"
+              Resource: !Ref SageMakerExecutionRole
+
+  StartTrainingJobFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: start_training_job.lambda_handler
+      Runtime: python3.6
+      CodeUri: ../lambda_functions/
+      Description: 'Starts model training job'
+      Environment:
+        Variables:
+          FEATURE_DIM: !Ref FeatureDimension
+          SAGEMAKER_ROLE: !Ref SageMakerExecutionRole
+          TRAINING_INSTANCE_TYPE: !Ref TrainingInstanceType
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "sagemaker:CreateTrainingJob"
+              Resource: "*"
+            - Effect: "Allow"
+              Action:
+                - "iam:PassRole"
+              Resource: !Ref SageMakerExecutionRole
+
+  NotifySlackFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: notify_slack.lambda_handler
+      Runtime: python3.6
+      CodeUri: ../lambda_functions/
+      Description: 'Posts message to Slack channel'
+      Environment:
+        Variables:
+          ENABLED: !Ref EnableSlack
+          ACCESS_TOKEN: !Ref SlackAccessToken
+          CHANNEL: !Ref SlackChannel
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+  CheckDataFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: check_data.lambda_handler
+      Runtime: python3.6
+      CodeUri: ../lambda_functions/
+      Description: 'Checks to see if new training data has been uploaded since last training job and adds data found in training interval to training manifest'
+      Timeout: 10
+      Environment:
+        Variables:
+          BUCKET: !Ref BucketName
+          INTERVAL: !Ref TrainingInterval
+          MODEL_PREFIX: !Ref ModelPrefix
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "s3:PutObject"
+                - "s3:GetObject"
+              Resource: !Sub 'arn:aws:s3:::${BucketName}/*'
+            - Effect: "Allow"
+              Action:
+                - "ssm:GetParameter"
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SSMParameter}'
+
+Outputs:
+  S3BucketName:
+    Description: S3 bucket that will hold training data and model artifacts
+    Value: !Ref BucketName
+
